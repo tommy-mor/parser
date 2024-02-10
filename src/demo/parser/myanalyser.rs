@@ -17,7 +17,6 @@ use serde::{ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer}
 use std::collections::{BTreeMap, HashMap};
 use std::convert::TryFrom;
 use std::ops::{Index, IndexMut};
-use std::vec;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
@@ -297,7 +296,6 @@ pub struct UserInfo {
     #[serde(skip)]
     pub entity_id: EntityId,
     pub team: Team,
-    pub health: Vec<(DemoTick, u16)>,
 }
 
 impl From<crate::demo::data::UserInfo> for UserInfo {
@@ -308,7 +306,6 @@ impl From<crate::demo::data::UserInfo> for UserInfo {
             user_id: info.player_info.user_id,
             steam_id: info.player_info.steam_id,
             entity_id: info.entity_id,
-            health: vec![],
             team: Team::default(),
         }
     }
@@ -494,11 +491,6 @@ impl Analyser {
             GameEvent::TeamPlayRoundWin(event) => {
                 if event.win_reason != WIN_REASON_TIME_LIMIT {
                     self.state.rounds.push(Round::from_event(event, tick))
-                }
-            }
-            GameEvent::PlayerHurt(event) => {
-                if let Some(user_state) = self.state.users.get_mut(&event.user_id.into()) {
-                    user_state.health.push((tick, event.health));
                 }
             }
             _ => {}
