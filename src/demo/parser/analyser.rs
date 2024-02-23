@@ -2,11 +2,13 @@ use crate::demo::data::{DemoTick, ServerTick};
 use crate::demo::gameevent_gen::{
     GameEvent, PlayerDeathEvent, PlayerSpawnEvent, TeamPlayRoundWinEvent,
 };
-use crate::demo::message::packetentities::EntityId;
+use crate::demo::message::packetentities::{EntityId, PacketEntity};
 use crate::demo::message::usermessage::{ChatMessageKind, SayText2Message, UserMessage};
-use crate::demo::message::{Message, MessageType};
+use crate::demo::message::{self, Message, MessageType};
+use crate::demo::packet::datatable::ServerClassName;
 use crate::demo::packet::stringtable::StringTableEntry;
 use crate::demo::parser::handler::{BorrowMessageHandler, MessageHandler};
+use crate::demo::sendprop::SendPropIdentifier;
 use crate::demo::vector::Vector;
 use crate::{ParserState, ReadResult, Stream};
 use bitbuffer::{BitWrite, BitWriteStream, Endianness};
@@ -374,16 +376,91 @@ pub struct World {
 }
 
 #[derive(Default, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Pause {
+    from: DemoTick,
+    to: DemoTick,
+}
+
+#[derive(Default, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Analyser {
     state: MatchState,
     pause_start: Option<DemoTick>,
     user_id_map: HashMap<EntityId, UserId>,
+
+    class_names: Vec<ServerClassName>,
 }
 
-#[derive(Default, Debug, Serialize, Deserialize, PartialEq)]
-pub struct Pause {
-    from: DemoTick,
-    to: DemoTick,
+use std::str::FromStr;
+
+impl Analyser {
+    pub fn handle_entity(
+        &mut self,
+        entity: &PacketEntity,
+        parser_state: &ParserState,
+        tick: ServerTick,
+    ) {
+        let class_name = self
+            .class_names
+            .get(usize::from(entity.server_class))
+            .map(|c| c.as_str())
+            .unwrap_or("");
+
+        match class_name {
+            "CTFPlayerResource" => {
+                for prop in entity.props(parser_state) {
+                    if let Some((table_name, prop_name)) = prop.identifier.names() {
+                        if let Ok(player_id) = u32::from_str(prop_name.as_str()) {
+                            let entity_id = EntityId::from(player_id);
+                            if let Some(player) = self
+                                .state
+                                .players
+                                .iter_mut()
+                                .find(|p| p.entity == entity_id)
+                            {
+                                match table_name.as_str() {
+                                    "m_iPlayerClass" => {
+                                        player.class = Class::new(
+                                            i64::try_from(&prop.value).unwrap_or_default(),
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "CTFPlayer" => {
+                const LOCAL_EYE_ANGLES: SendPropIdentifier =
+                    SendPropIdentifier::new("DT_TFLocalPlayerExclusive", "m_angEyeAngles[1]");
+                const NON_LOCAL_EYE_ANGLES: SendPropIdentifier =
+                    SendPropIdentifier::new("DT_TFNonLocalPlayerExclusive", "m_angEyeAngles[1]");
+                const LOCAL_PITCH_ANGLES: SendPropIdentifier =
+                    SendPropIdentifier::new("DT_TFLocalPlayerExclusive", "m_angEyeAngles[0]");
+                const NON_LOCAL_PITCH_ANGLES: SendPropIdentifier =
+                    SendPropIdentifier::new("DT_TFNonLocalPlayerExclusive", "m_angEyeAngles[0]");
+
+                let player = self.state.get_or_create_player(entity.entity_index);
+
+                for prop in &entity.props {
+                    match prop.identifier {
+                        LOCAL_EYE_ANGLES | NON_LOCAL_EYE_ANGLES => {
+                            player
+                                .view_angle
+                                .push((tick, f32::try_from(&prop.value).unwrap_or_default()));
+                        }
+                        LOCAL_PITCH_ANGLES | NON_LOCAL_PITCH_ANGLES => {
+                            player
+                                .pitch_angle
+                                .push((tick, f32::try_from(&prop.value).unwrap_or_default()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl MessageHandler for Analyser {
@@ -397,7 +474,20 @@ impl MessageHandler for Analyser {
                 | MessageType::ServerInfo
                 | MessageType::NetTick
                 | MessageType::SetPause
+                | MessageType::PacketEntities
         )
+    }
+
+    fn handle_data_tables(
+        &mut self,
+        _tables: &[crate::demo::packet::datatable::ParseSendTable],
+        server_classes: &[crate::demo::packet::datatable::ServerClass],
+        _parser_state: &ParserState,
+    ) {
+        self.class_names = server_classes
+            .iter()
+            .map(|class| class.name.clone())
+            .collect();
     }
 
     fn handle_message(&mut self, message: &Message, tick: DemoTick, _parser_state: &ParserState) {
@@ -421,6 +511,13 @@ impl MessageHandler for Analyser {
                         from: start,
                         to: tick,
                     })
+                }
+            }
+            Message::PacketEntities(message) => {
+                if let Some(tick) = message.delta {
+                    for entity in &message.entities {
+                        self.handle_entity(entity, _parser_state, tick);
+                    }
                 }
             }
             _ => {}
@@ -528,6 +625,14 @@ impl Analyser {
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Default)]
+pub struct Player {
+    entity: EntityId,
+    pub class: Class,
+    pub view_angle: Vec<(ServerTick, f32)>,
+    pub pitch_angle: Vec<(ServerTick, f32)>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct MatchState {
     pub chat: Vec<ChatMessage>,
@@ -537,4 +642,26 @@ pub struct MatchState {
     pub start_tick: ServerTick,
     pub interval_per_tick: f32,
     pub pauses: Vec<Pause>,
+    pub players: Vec<Player>,
+}
+
+impl MatchState {
+    pub fn get_or_create_player(&mut self, entity_id: EntityId) -> &mut Player {
+        let index = self
+            .players
+            .iter()
+            .enumerate()
+            .find(|(_index, player)| player.entity == entity_id)
+            .map(|(index, _)| index);
+        match index {
+            Some(index) => &mut self.players[index],
+            None => {
+                self.players.push(Player {
+                    entity: entity_id,
+                    ..Default::default()
+                });
+                self.players.last_mut().unwrap()
+            }
+        }
+    }
 }
